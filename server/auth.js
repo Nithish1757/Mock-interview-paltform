@@ -35,7 +35,7 @@ function clearSession(res) {
 }
 
 function publicUser(user) {
-  return { id: String(user._id), name: user.name, email: user.email, phone: user.phone || '', collegeName: user.collegeName || '', profileComplete: Boolean(user.profileComplete), settings: user.settings || { outputLanguage: 'English' } };
+  return { id: String(user._id), name: user.name, email: user.email, phone: user.phone || '', collegeName: user.collegeName || '', profileComplete: Boolean(user.profileComplete), demoMode: Boolean(user.demoMode), settings: user.settings || { outputLanguage: 'English' } };
 }
 
 async function attachUser(req, _res, next) {

@@ -17,7 +17,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Media-Mime, X-Media-Name, X-Media-Title, X-Output-Language');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Media-Mime, X-Media-Name, X-Media-Title, X-Output-Language, X-PrepAI-Source, X-PrepAI-Title, X-PrepAI-Name, X-PrepAI-Mime, X-PrepAI-Video-Language, X-PrepAI-Explanation-Language');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
   }
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -55,7 +55,7 @@ server.on('error', async error => {
         console.log(`PrepAI API already running on port ${port}; reusing the existing service.`);
         process.exit(0);
       }
-    } catch {}
+    } catch (healthError) { console.debug(`Occupied port does not expose PrepAI health: ${healthError.message}`); }
     console.error(`Port ${port} is already in use by another service. Set PORT to a free port; PrepAI did not start a duplicate server.`);
   } else console.error(`PrepAI API could not start: ${error.message}`);
   process.exitCode = 1;

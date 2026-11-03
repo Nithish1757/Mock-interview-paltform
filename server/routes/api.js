@@ -1,11 +1,21 @@
 const express = require('express');
 const mongoose = require('mongoose');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { randomUUID } = require('node:crypto');
+const { Transform } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const { Learning, Interview } = require('../models/Record');
 const { publicUser } = require('../auth');
-const { topicNames, buildQuestions, evaluateAnswer } = require('../interviewBank');
+const { topicNames, INTERVIEW_QUESTION_COUNT, buildQuestions, evaluateAnswer } = require('../interviewBank');
+const { checkServices, processVideoLearning, answerVideoQuestion, ollamaJson, supportedLanguages } = require('../videoLearning');
 
 const router = express.Router();
-const languages = ['English', 'Spanish', 'Hindi', 'French', 'German', 'Japanese', 'Portuguese', 'Chinese', 'Korean', 'Arabic', 'Russian', 'Italian'];
+const languages = supportedLanguages.map(language => language.name);
+const videoLanguages = ['Auto Detect', ...languages];
+const videoJobs = new Map();
+const uploadDir = path.join(os.tmpdir(), 'prepai-uploads');
 
 function fail(status, message) {
   const error = new Error(message);
@@ -233,9 +243,77 @@ router.put('/profile', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+router.get('/learning/services', async (_req, res) => {
+  res.json({ services: await checkServices(), model: process.env.OLLAMA_MODEL || 'llama3.2', languages: supportedLanguages });
+});
+
+router.post('/learning/process', async (req, res, next) => {
+  let file;
+  try {
+    const contentType = String(req.headers['content-type'] || '').toLowerCase();
+    const rawUpload = contentType.startsWith('audio/') || contentType.startsWith('video/') || contentType === 'application/octet-stream';
+    const sourceType = String(rawUpload ? req.get('X-PrepAI-Source') || 'upload' : req.body.sourceType || '');
+    const title = String(rawUpload ? decodeURIComponent(req.get('X-PrepAI-Title') || '') : req.body.title || '').trim().slice(0, 100);
+    const sourceUrl = sourceType === 'youtube' ? validateYouTubeUrl(String(req.body.youtubeUrl || '').trim()) : '';
+    const videoLanguage = videoLanguages.includes(rawUpload ? req.get('X-PrepAI-Video-Language') : req.body.videoLanguage) ? (rawUpload ? req.get('X-PrepAI-Video-Language') : req.body.videoLanguage) : 'Auto Detect';
+    const requestedExplanationLanguage = rawUpload ? req.get('X-PrepAI-Explanation-Language') : req.body.explanationLanguage;
+    const explanationLanguage = languages.includes(requestedExplanationLanguage) ? requestedExplanationLanguage : 'English';
+    const transcript = String(rawUpload ? '' : req.body.transcript || '').trim();
+    if (!['youtube', 'upload', 'transcript'].includes(sourceType)) return res.status(400).json({ error: 'Choose a YouTube video, media upload, or transcript.' });
+    if (!title && sourceType !== 'youtube' && sourceType !== 'upload') return res.status(400).json({ error: 'Enter a session title for this learning source.' });
+    if (sourceType === 'youtube' && !sourceUrl) return res.status(400).json({ error: 'Enter a valid public YouTube URL.' });
+    if (sourceType === 'upload' && !rawUpload) return res.status(400).json({ error: 'Upload the audio or video file to the local processor.' });
+    if (sourceType === 'transcript' && transcript.length < 30) return res.status(400).json({ error: 'Paste at least 30 characters of transcript.' });
+    if (rawUpload) {
+      const maximumBytes = Number(process.env.MAX_MEDIA_FILE_MB || 1024) * 1024 * 1024;
+      if (Number(req.headers['content-length'] || 0) > maximumBytes) return res.status(413).json({ error: `Media exceeds the ${process.env.MAX_MEDIA_FILE_MB || 1024} MB upload limit.` });
+      const mimeType = contentType === 'application/octet-stream' ? String(req.get('X-PrepAI-Mime') || '') : contentType.split(';')[0];
+      if (!mimeType.startsWith('audio/') && !mimeType.startsWith('video/')) return res.status(400).json({ error: 'Choose a supported audio or video file.' });
+      await fs.promises.mkdir(uploadDir, { recursive: true });
+      const originalname = path.basename(decodeURIComponent(req.get('X-PrepAI-Name') || 'video-upload')).slice(0, 160);
+      const target = path.join(uploadDir, `${randomUUID()}${path.extname(originalname).slice(0, 12)}`);
+      let bytes = 0;
+      const limiter = new Transform({ transform(chunk, _encoding, callback) { bytes += chunk.length; callback(bytes > maximumBytes ? new Error(`Media exceeds the ${process.env.MAX_MEDIA_FILE_MB || 1024} MB upload limit.`) : null, chunk); } });
+      try { await pipeline(req, limiter, fs.createWriteStream(target, { flags: 'wx' })); }
+      catch (error) { await fs.promises.rm(target, { force: true }); return res.status(error.message.includes('upload limit') ? 413 : 400).json({ error: error.message || 'The media upload was interrupted.' }); }
+      file = { path: target, originalname, mimetype: mimeType };
+    }
+    const activeForUser = [...videoJobs.values()].filter(job => job.userId === String(req.userId) && job.status === 'processing').length;
+    if (activeForUser >= 2) { if (file) await fs.promises.rm(file.path, { force: true }); return res.status(429).json({ error: 'Two local video jobs are already running for this account. Wait for one to finish and try again.' }); }
+    for (const [id, oldJob] of videoJobs) if (Date.now() - Date.parse(oldJob.createdAt) > 24 * 60 * 60 * 1000) videoJobs.delete(id);
+    const job = { id: randomUUID(), userId: String(req.userId), status: 'processing', stage: sourceType === 'youtube' ? 'captions' : sourceType === 'transcript' ? 'analyzing' : 'extracting', progress: 1, message: 'Preparing local processing', createdAt: new Date().toISOString() };
+    videoJobs.set(job.id, job);
+    res.status(202).json({ jobId: job.id, status: job.status, stage: job.stage, progress: job.progress });
+    processVideoLearning({ title, sourceType, sourceUrl, videoLanguage, explanationLanguage, transcript, file, onProgress: (stage, progress, message) => Object.assign(job, { stage, progress, message }) })
+      .then(async content => {
+        Object.assign(job, { stage: 'saving', progress: 96, message: 'Saving the transcript and study pack to your account' });
+        const record = await Learning.create({
+          userId: req.userId, title: content.title, transcript: content.transcript, sourceType,
+          sourceUrl: sourceUrl || undefined, sourceMetadata: file ? { ...content.sourceMetadata, fileName: file.originalname, mimeType: file.mimetype, processedLocally: true } : content.sourceMetadata,
+          sourceLanguage: content.sourceLanguage, videoLanguage: content.videoLanguage, outputLanguage: content.outputLanguage, explanationLanguage: content.explanationLanguage, generationMode: content.generationMode,
+          fallbackLabel: content.fallbackLabel, summary: content.summary, explanation: content.explanation,
+          notes: content.notes, keyPoints: content.keyPoints, revisionPoints: content.revisionPoints, whatToLearnNext: content.whatToLearnNext,
+          examples: content.examples, questions: content.questions, answers: content.answers,
+          quiz: content.quiz, flashcards: content.flashcards, importantTimestamps: content.importantTimestamps,
+          chatHistory: [],
+        });
+        Object.assign(job, { status: 'complete', stage: 'complete', progress: 100, message: 'Study pack saved', sessionId: String(record._id), completedAt: new Date().toISOString() });
+      })
+      .catch(error => Object.assign(job, { status: 'failed', stage: 'failed', progress: 100, error: error.message || 'Local media processing failed. No study pack was saved.' }));
+  } catch (error) { if (file?.path) await fs.promises.rm(file.path, { force: true }).catch(() => {}); next(error); }
+});
+
+router.get('/learning/jobs/:jobId', (req, res) => {
+  const job = videoJobs.get(req.params.jobId);
+  if (!job || job.userId !== String(req.userId)) return res.status(404).json({ error: 'Processing job not found.' });
+  const { userId, ...publicJob } = job;
+  if (job.status === 'complete') return Learning.findOne({ _id: job.sessionId, userId: req.userId }).then(session => session ? res.json({ ...publicJob, session }) : res.status(404).json({ error: 'Saved study session was not found.' })).catch(error => res.status(500).json({ error: error.message }));
+  res.json(publicJob);
+});
+
 router.get('/learning', async (req, res, next) => {
   try {
-    const sessions = await Learning.find({ userId: req.userId }).sort({ createdAt: -1 }).limit(30).select('-transcript');
+    const sessions = await Learning.find({ userId: req.userId }).sort({ createdAt: -1 }).limit(30).select('-transcript -segments');
     res.json({ sessions });
   } catch (error) { next(error); }
 });
@@ -276,6 +354,7 @@ router.post('/learning', async (req, res, next) => {
     const transcript = String(req.body.transcript || '').trim();
     const sourceType = String(req.body.sourceType || 'transcript');
     if (!title) return res.status(400).json({ error: 'Enter a technical topic or session title.' });
+    if (['youtube', 'upload'].includes(sourceType)) return res.status(400).json({ error: 'YouTube and uploaded media must complete local transcription and analysis before a study pack can be saved.' });
     let youtubeUrl = null;
     let media = null;
     if (sourceType === 'youtube') {
@@ -302,10 +381,54 @@ router.post('/learning/:id/ask', async (req, res, next) => {
     if (!record) return res.status(404).json({ error: 'Study pack not found.' });
     const question = String(req.body.question || '').trim().slice(0, 1000);
     if (question.length < 3) return res.status(400).json({ error: 'Enter a question about this learning material.' });
-    const result = localSessionAnswer(record, question);
+    const result = record.generationMode === 'local-whisper-ollama'
+      ? await answerVideoQuestion(record, question)
+      : localSessionAnswer(record, question);
     record.chatHistory = [...(record.chatHistory || []), { question, answer: result.answer, mode: result.mode, askedAt: new Date() }].slice(-100);
     await record.save();
     res.json(result);
+  } catch (error) { next(error); }
+});
+
+router.post('/learning/:id/action', async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Study session not found.' });
+    const record = await Learning.findOne({ _id: req.params.id, userId: req.userId });
+    if (!record) return res.status(404).json({ error: 'Study session not found.' });
+    if (record.generationMode !== 'local-whisper-ollama' || !record.transcript) return res.status(400).json({ error: 'This option needs a session processed from a transcript or video.' });
+    const actions = {
+      explain: 'Explain the topic again more simply using a step-by-step explanation and one example grounded in the transcript.',
+      practice: 'Create five practice questions grounded in the transcript, each with an answer and source reference.',
+      quiz: 'Create five quiz questions grounded in the transcript, each with four options, the zero-based correct option index, answer explanation, and timestamp/source reference.',
+      examples: 'Give additional examples only when supported by the transcript. If it gives no examples, explicitly say so and label any general illustrative example as external explanation.',
+      next: 'Suggest useful next concepts based on the transcript; distinguish recommendations from things explicitly stated in the video.',
+    };
+    const action = String(req.body.action || '');
+    if (!actions[action]) return res.status(400).json({ error: 'Choose a supported learning option.' });
+    const result = await ollamaJson(
+      `You are a source-grounded tutor. Use only the timestamped transcript as evidence. Write in ${record.outputLanguage || 'English'}. Never claim a detail was in the video unless supported. Return JSON with a short text field, plus any relevant questions, answers, quiz, examples, recommendations, and sourceReferences arrays.`,
+      `Session title (context only): ${record.title}\nSaved full-session analysis derived from the transcript:\nSummary: ${record.summary}\nExplanation: ${record.explanation}\nKey points: ${(record.keyPoints || []).join('\n')}\nStudy notes: ${(record.notes || []).join('\n')}\nTask: ${actions[action]}\nTimestamped transcript source (may be long):\n${String(record.transcript).slice(0, 80000)}`,
+      180000,
+    );
+    res.json({ ...result, mode: 'transcript-grounded-ollama', action });
+  } catch (error) { next(error); }
+});
+
+router.post('/learning/:id/quiz-answer', async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Study session not found.' });
+    const record = await Learning.findOne({ _id: req.params.id, userId: req.userId });
+    if (!record) return res.status(404).json({ error: 'Study session not found.' });
+    const question = String(req.body.question || '').trim().slice(0, 1000);
+    const expectedAnswer = String(req.body.expectedAnswer || '').trim().slice(0, 2000);
+    const answer = String(req.body.answer || '').trim().slice(0, 2000);
+    if (!question || !expectedAnswer || !answer) return res.status(400).json({ error: 'Submit an answer to the current quiz question.' });
+    const result = await ollamaJson(
+      `Evaluate a learner using only the transcript evidence and expected answer provided. Write feedback in ${record.outputLanguage || 'English'}. If evidence is ambiguous, return status "needs-manual-review" and do not invent correctness. Return JSON {status,correct,feedback,explanation,sourceReferences}.`,
+      `Transcript evidence:\n${String(record.transcript || '').slice(0, 80000)}\nQuestion: ${question}\nExpected answer based on transcript: ${expectedAnswer}\nLearner answer: ${answer}`,
+      120000,
+    );
+    res.json({ ...result, mode: 'transcript-grounded-ollama' });
   } catch (error) { next(error); }
 });
 
@@ -332,7 +455,7 @@ router.post('/interviews/start', async (req, res, next) => {
     const questions = buildQuestions(topic, difficulty);
     const record = await Interview.create({ userId: req.userId, role, topic, difficulty, voiceMode, questions, answers: [], answerEvaluations: [], voiceEvaluations: [], report: null });
     const response = record.toObject();
-    response.questions = record.questions.map(({ expectedAnswer, explanation, keywords, ...question }) => question);
+    response.questions = record.questions.map(({ expectedAnswer, explanation, ...question }) => question);
     res.status(201).json(response);
   } catch (error) { next(error); }
 });
@@ -341,7 +464,7 @@ async function saveInterviewAnswer(req, res, next, voiceOnly = false) {
   try {
     const index = Number(req.body.index);
     const answer = String(req.body.answer || '').trim().slice(0, 2400);
-    if (!Number.isInteger(index) || index < 0 || index > 4) return res.status(400).json({ error: 'Choose a valid question.' });
+    if (!Number.isInteger(index) || index < 0 || index >= INTERVIEW_QUESTION_COUNT) return res.status(400).json({ error: 'Choose a valid question.' });
     if (answer.length < 3) return res.status(400).json({ error: 'Speak or type an answer before continuing.' });
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Interview session not found.' });
     const query = { _id: req.params.id, userId: req.userId };
@@ -355,7 +478,7 @@ async function saveInterviewAnswer(req, res, next, voiceOnly = false) {
     interview.answerEvaluations[index] = evaluation;
     if (voiceOnly) interview.voiceEvaluations[index] = evaluation;
     await interview.save();
-    res.json({ evaluation, correctAnswer: question.expectedAnswer, explanation: question.explanation, nextQuestion: interview.questions[index + 1] || null, completed: index === 4 });
+    res.json({ evaluation, correctAnswer: question.expectedAnswer, explanation: question.explanation, nextQuestion: interview.questions[index + 1] || null, completed: index === interview.questions.length - 1 });
   } catch (error) { next(error); }
 }
 
@@ -365,24 +488,42 @@ router.post('/interviews/:id/voice-answer', (req, res, next) => saveInterviewAns
 router.post('/interviews/:id/submit', async (req, res, next) => {
   try {
     const { answers } = req.body;
-    if (!Array.isArray(answers) || answers.length !== 5 || answers.some(answer => !String(answer).trim())) return res.status(400).json({ error: 'Answer all five questions before generating your report.' });
+    if (!Array.isArray(answers) || answers.length !== INTERVIEW_QUESTION_COUNT || answers.some(answer => !String(answer).trim())) return res.status(400).json({ error: `Answer all ${INTERVIEW_QUESTION_COUNT} questions before generating your report.` });
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Interview session not found.' });
     const interview = await Interview.findOne({ _id: req.params.id, userId: req.userId });
     if (!interview) return res.status(404).json({ error: 'Interview session not found.' });
-    const evaluations = answers.map((answer, index) => evaluateAnswer(interview.questions[index], String(answer).trim()));
-    const average = key => Math.round(evaluations.reduce((sum, item) => sum + item.scores[key], 0) / evaluations.length);
-    const overallScore = Math.round(evaluations.reduce((sum, item) => sum + item.score, 0) / evaluations.length);
-    const weak = evaluations.some(item => item.scores.correctness < 60 || item.scores.completeness < 60);
+    const evaluations = answers.map((answer, index) => {
+      const evaluation = evaluateAnswer(interview.questions[index], String(answer).trim());
+      return { ...evaluation, question: interview.questions[index].question, referenceAnswer: interview.questions[index].expectedAnswer, explanation: interview.questions[index].explanation };
+    });
+    const automaticallyEvaluated = evaluations.filter(item => item.status === 'evaluated');
+    const reviewRequiredCount = evaluations.length - automaticallyEvaluated.length;
+    const average = key => automaticallyEvaluated.length
+      ? Math.round(automaticallyEvaluated.reduce((sum, item) => sum + item.scores[key], 0) / automaticallyEvaluated.length)
+      : null;
+    const overallScore = reviewRequiredCount
+      ? null
+      : Math.round(evaluations.reduce((sum, item) => sum + item.score, 0) / evaluations.length);
+    const weak = automaticallyEvaluated.some(item => item.score < 60 || item.missingConcepts.length > 0);
     const report = {
       overallScore,
-      scores: { technicalCorrectness: average('correctness'), relevance: average('relevance'), completeness: average('completeness'), problemSolving: average('completeness'), communication: average('clarity'), grammar: average('grammar'), clarity: average('clarity') },
-      strengths: [overallScore >= 70 ? 'Your answers covered many of the reference concepts.' : 'You completed all five answers and have clear feedback to guide another attempt.', ...evaluations.filter(item => item.score >= 70).slice(0, 2).map(item => item.strength)],
-      weaknesses: [weak ? `Review ${interview.topic} concepts that were absent from your answers.` : 'Add examples and explain the reasoning behind each answer.', ...evaluations.filter(item => item.score < 60).slice(0, 2).map(item => item.improvement)],
-      improvedAnswers: interview.questions.map((question, index) => `Reference answer: ${question.expectedAnswer} Explanation: ${question.explanation}`),
-      topicsToRevise: weak ? [interview.topic, 'Review answers with low concept coverage.'] : [interview.topic, 'Practice explaining examples and trade-offs.'],
+      scoreStatus: reviewRequiredCount ? 'needs-manual-review' : 'evaluated',
+      reviewRequiredCount,
+      evaluatedAnswerCount: automaticallyEvaluated.length,
+      scores: { correctness: average('correctness'), relevance: average('relevance'), completeness: average('completeness'), problemSolving: average('problemSolving'), communication: average('communication') },
+      strengths: [...new Set(automaticallyEvaluated.map(item => item.strength).filter(Boolean))],
+      weaknesses: [...new Set([
+        ...evaluations.flatMap(item => item.missingConcepts.map(concept => `Add or clarify: ${concept}`)),
+        ...evaluations.filter(item => item.status === 'needs-manual-review').map(item => item.feedback),
+      ])],
+      improvedAnswers: interview.questions.map(question => `Reference answer: ${question.expectedAnswer} Explanation: ${question.explanation}`),
+      topicsToRevise: weak ? [interview.topic, 'Review the missing concepts shown in each answer.'] : (reviewRequiredCount ? [interview.topic, 'Manually review the flagged responses.'] : []),
       questionEvaluations: evaluations,
-      evaluationMethod: 'local-topic-question-bank',
-      evaluationNote: 'Scores use local reference keywords and response structure; they are a study aid, not expert semantic grading. Behavioral answers are scored for structure, not personal facts.',
+      evaluationMethod: 'reference-clause-rubric',
+      scoreFormula: 'Each evaluated answer is the equal-weight mean of correctness, relevance, completeness, problem-solving, and communication. The report score is the mean of all question scores. If any answer needs manual review, the report withholds the overall score; dimension averages include evaluated answers only.',
+      evaluationNote: reviewRequiredCount
+        ? `${reviewRequiredCount} answer(s) need manual review. No overall score is shown; dimension averages use only automatically evaluated answers.`
+        : 'Scores compare answer wording and clause coverage with the saved reference answer. They are a local study rubric, not expert semantic grading.',
     };
     interview.answers = answers;
     interview.answerEvaluations = evaluations;

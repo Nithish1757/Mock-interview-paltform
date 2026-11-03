@@ -3,6 +3,12 @@ node_modules
 client/dist
 .DS_Store
 *.log
+models/ggml-*.bin
+tools/local/
+tools/downloads/
 
 .pnpm-store
 e2e/
+tools/ollama-home/
+tools/ollama-models/
+tools/local-test*/

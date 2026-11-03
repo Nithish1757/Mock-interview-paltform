@@ -3,32 +3,39 @@
   "version": "1.0.0",
   "private": true,
   "packageManager": "pnpm@11.25.0",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "concurrently --kill-others \"pnpm:server:dev\" \"pnpm:client:dev\"",
     "server:dev": "nodemon server/index.js",
     "client:dev": "vite --config client/vite.config.js",
     "build": "vite build --config client/vite.config.js",
+    "lint": "eslint client/src server --ext .js,.jsx",
+    "test": "node --test server/*.test.js",
     "start": "node server/index.js"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
     "axios": "^1.7.9",
     "concurrently": "^9.1.2",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "lucide-react": "^0.468.0",
     "mongoose": "^8.9.5",
+    "multer": "2.0.2",
+    "postcss": "^8.4.49",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.28.1",
-    "vite": "^6.0.7",
     "tailwindcss": "^3.4.17",
-    "postcss": "^8.4.49",
-    "autoprefixer": "^10.4.20"
+    "vite": "^6.0.7"
   },
-  "devDependencies": { "nodemon": "^3.1.7" }
+  "devDependencies": {
+    "eslint": "8.57.1",
+    "eslint-plugin-react": "7.37.4",
+    "eslint-plugin-react-hooks": "5.2.0",
+    "nodemon": "^3.1.7"
+  }
 }
-
-
-

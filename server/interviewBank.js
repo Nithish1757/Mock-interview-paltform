@@ -97,12 +97,13 @@ const topics = {
 };
 
 const topicNames = Object.keys(topics);
+const INTERVIEW_QUESTION_COUNT = 15;
 function buildQuestions(topic, difficulty) {
   const data = topics[topic];
   if (!data) return null;
-  const technical = data.items.map(([question, expectedAnswer, keywords], index) => ({
+  const technical = data.items.map(([question, expectedAnswer]) => ({
     type: 'Technical', question: `${question}${difficulty === 'Advanced' ? ' Include trade-offs or edge cases where relevant.' : difficulty === 'Beginner' ? ' Explain it in clear, simple terms.' : ''}`,
-    expectedAnswer, explanation: expectedAnswer, keywords, category: topic, level: difficulty,
+    expectedAnswer, explanation: expectedAnswer, category: topic, level: difficulty,
   }));
   const behavioral = topic === 'HR/behavioral';
   const questions = [...technical, {
@@ -110,46 +111,117 @@ function buildQuestions(topic, difficulty) {
     question: `A ${topic} problem is causing a blocker in a ${difficulty.toLowerCase()}-level task. How would you investigate it, choose a solution, and verify the result?`,
     expectedAnswer: `Clarify the expected behavior, reproduce and isolate the issue, use relevant ${topic} concepts to compare options, apply a focused fix, and verify with a suitable test. Explain trade-offs and the result.`,
     explanation: 'A strong scenario response states the goal, gathers evidence, explains the decision, and verifies the outcome.',
-    keywords: ['clarify', 'reproduce', 'evidence', 'solution', 'test', 'result'],
   }, {
     type: 'Behavioral', category: topic, level: difficulty,
     question: behavioral ? 'Tell me about a time you learned a difficult concept and applied it.' : 'Tell me about a time you used or learned something related to this topic to solve a problem.',
     expectedAnswer: 'Answers vary. Give an honest example using STAR: Situation, Task, Action, and Result. Explain your own contribution and what you learned.',
     explanation: 'Behavioral answers are personal, not fact-matched. A clear STAR structure makes the example specific and easy to follow.',
-    keywords: ['situation', 'task', 'action', 'result'],
   }];
-  return questions;
+  // Keep the existing local five-question bank and run it for three practice rounds.
+  return Array.from({ length: INTERVIEW_QUESTION_COUNT / questions.length }, () => questions).flat();
+}
+
+const rubricStopWords = new Set('a an and are as at be because by can could did do does for from had has have how i if in into is it its of on or that the their then this to use used was were what when where which while who why with you your'.split(' '));
+const termAliases = {
+  executes:'execute', executed:'execute', execution:'execute', runs:'run', running:'run', ran:'run',
+  loads:'load', loaded:'load', loading:'load', verifies:'verify', verified:'verify',
+  values:'value', keys:'key', objects:'object', classes:'class', preserves:'preserve',
+  ordered:'order', uniqueness:'unique', duplicates:'duplicate', updates:'update', updated:'update',
+  resources:'resource', queries:'query', writes:'write', inserts:'insert', deletes:'delete',
+  matches:'match', matching:'match', renders:'render', rendered:'render', components:'component',
+  threads:'thread', processes:'process', addresses:'address', maps:'map', mapped:'map',
+  children:'child', parents:'parent', lists:'list', tuples:'tuple', dictionaries:'dictionary',
+  asynchronous:'async', asynchronously:'async', incrementally:'incremental', inputs:'input', passed:'pass',
+};
+
+function normalizedTerms(text) {
+  return (String(text || '').toLowerCase().match(/[a-z0-9+#]+(?:['’-][a-z0-9]+)*/g) || [])
+    .map(term => termAliases[term] || term)
+    .filter(term => term.length > 1 && !rubricStopWords.has(term));
+}
+
+function referenceCriteria(reference) {
+  const clauses = String(reference || '').split(/(?:[.;,:]|\b(?:and|while|then|but|whereas|so)\b)/i)
+    .map(clause => ({ text: clause.trim(), terms: [...new Set(normalizedTerms(clause))] }))
+    .filter(clause => clause.terms.length >= 2);
+  if (clauses.length) return clauses;
+  return [{ text: String(reference || '').trim(), terms: [...new Set(normalizedTerms(reference))] }];
+}
+
+function overlap(left, right) {
+  const rightSet = new Set(right);
+  return left.filter(term => rightSet.has(term));
 }
 
 function evaluateAnswer(question, answer) {
-  const normalized = String(answer || '').toLowerCase();
-  const keywords = question.keywords || [];
-  const matched = keywords.filter(word => normalized.includes(word.toLowerCase()));
-  const words = normalized.trim().split(/\s+/).filter(Boolean).length;
-  const sentences = normalized.split(/[.!?]+/).filter(Boolean).length;
-  const conceptScore = keywords.length ? Math.round((matched.length / keywords.length) * 100) : 50;
-  const correctness = Math.min(100, Math.round(conceptScore * 0.8 + (words >= 10 ? 20 : words * 2)));
-  const relevance = Math.min(100, Math.round(45 + Math.min(words, 65) * 0.45 + matched.length * 3));
-  const completeness = Math.min(100, Math.round(35 + Math.min(words, 80) * 0.35 + matched.length * 4));
-  const grammar = Math.min(100, Math.round(55 + Math.min(sentences, 4) * 8 + (/[.!?]$/.test(answer.trim()) ? 10 : 0)));
-  const clarity = Math.min(100, Math.round(48 + Math.min(sentences, 4) * 8 + (words >= 12 ? 12 : 0)));
-  const average = Math.round((correctness + relevance + completeness + grammar + clarity) / 5);
+  const response = String(answer || '').trim();
+  const answerTerms = [...new Set(normalizedTerms(response))];
+  const referenceTerms = [...new Set(normalizedTerms(question.expectedAnswer))];
+  const questionTerms = [...new Set(normalizedTerms(question.question))];
+  const criteria = referenceCriteria(question.expectedAnswer);
+  const matchedTerms = overlap(referenceTerms, answerTerms);
+  const referenceCoverage = referenceTerms.length ? matchedTerms.length / referenceTerms.length : 0;
+  const answerPrecision = answerTerms.length ? matchedTerms.length / answerTerms.length : 0;
+  const queryCoverage = questionTerms.length ? overlap(questionTerms, answerTerms).length / questionTerms.length : 0;
+  const coveredCriteria = criteria.filter(criterion => {
+    const hits = overlap(criterion.terms, answerTerms).length;
+    return criterion.terms.length > 0 && hits / criterion.terms.length >= 0.5;
+  });
+  const criterionCoverage = criteria.length ? coveredCriteria.length / criteria.length : referenceCoverage;
+  const missingConcepts = criteria.filter(criterion => !coveredCriteria.includes(criterion)).map(criterion => criterion.text);
+
+  // Compare multiword evidence against the question's own reference clauses; no answer-length bonus or canned score.
+  const referenceBigrams = [];
+  for (let i = 0; i < referenceTerms.length - 1; i++) referenceBigrams.push(referenceTerms[i] + ' ' + referenceTerms[i + 1]);
+  const answerBigrams = new Set();
+  for (let i = 0; i < answerTerms.length - 1; i++) answerBigrams.add(answerTerms[i] + ' ' + answerTerms[i + 1]);
+  const phraseCoverage = referenceBigrams.length ? referenceBigrams.filter(phrase => answerBigrams.has(phrase)).length / referenceBigrams.length : referenceCoverage;
+
+  const matchedCriterionIndexes = criteria.map((criterion, index) => coveredCriteria.includes(criterion) ? index : -1).filter(index => index >= 0);
+  const inOrder = matchedCriterionIndexes.filter((index, position) => position === 0 || index > matchedCriterionIndexes[position - 1]).length;
+  const answerClauses = response.split(/[.!?;]+/).map(clause => [...new Set(normalizedTerms(clause))]).filter(clause => clause.length >= 2);
+  const supportedAnswerClauses = answerClauses.filter(clause => overlap(clause, referenceTerms).length / clause.length >= 0.35).length;
+  const communication = answerClauses.length ? Math.round(100 * supportedAnswerClauses / answerClauses.length) : null;
+
+  const enoughEvidence = answerTerms.length >= 4 && referenceTerms.length >= 4 && criterionCoverage > 0 && referenceCoverage >= 0.16;
   const behavioral = question.type === 'Behavioral';
-  const feedback = behavioral
-    ? (matched.length >= 3 ? 'Your response includes several STAR elements. Make the outcome and your personal contribution explicit.' : 'Behavioral answers are personal; use a specific example and structure it as Situation, Task, Action, and Result.')
-    : matched.length >= Math.ceil(keywords.length * 0.6)
-      ? 'Your answer covers several expected concepts. Compare it with the reference answer and add a concrete example or trade-off.'
-      : 'Some expected concepts were missing from your answer. Review the reference answer below, then explain the key idea in your own words.';
-  const strength = matched.length ? `You addressed: ${matched.slice(0, 4).join(', ')}.` : words >= 10 ? 'You gave enough detail to identify your reasoning.' : 'You started with a direct response.';
-  const missing = keywords.filter(word => !matched.includes(word));
-  const improvement = missing.length ? `Consider covering: ${missing.slice(0, 4).join(', ')}. Then add a specific example.` : 'Add a specific example and state how you verified the result.';
+  const manualReason = !response
+    ? 'No answer was provided.'
+    : !enoughEvidence
+        ? 'The response does not contain enough clearly aligned evidence to score it reliably.'
+        : '';
+  if (manualReason) return {
+    status: 'needs-manual-review', scores: { correctness: null, relevance: null, completeness: null, problemSolving: null, communication: null },
+    score: null, missingConcepts: missingConcepts.length ? missingConcepts : criteria.map(criterion => criterion.text),
+    feedback: 'Needs manual review. ' + manualReason + ' No score was assigned.', strength: '',
+    improvement: 'Compare your response with the reference answer and ask a reviewer to judge meaning and context.',
+    evaluationMethod: 'reference-clause-rubric', note: 'Local comparison cannot reliably determine semantic correctness for this response.',
+    referenceCoverage: Math.round(referenceCoverage * 100), answer: response,
+  };
+
+  const scores = {
+    correctness: Math.round(100 * (referenceCoverage * 0.7 + phraseCoverage * 0.3)),
+    relevance: Math.round(100 * (referenceCoverage * 0.65 + queryCoverage * 0.35)),
+    completeness: Math.round(criterionCoverage * 100),
+    problemSolving: Math.round((matchedCriterionIndexes.length ? inOrder / criteria.length : 0) * 100),
+    communication: communication ?? Math.round(answerPrecision * 100),
+  };
+  const score = Math.round(Object.values(scores).reduce((sum, value) => sum + value, 0) / 5);
+  const coveredTexts = coveredCriteria.map(criterion => criterion.text).filter(Boolean);
+  const feedback = criterionCoverage === 1
+    ? 'Your response covers each reference criterion. Review the notes below and keep the explanation tied to the question.'
+    : 'Your response covers part of the reference. The missing concepts below show what to add; verify any paraphrase with a reviewer if its meaning differs.';
   return {
-    scores: { correctness, relevance, completeness, grammar, clarity },
-    score: average, feedback, strength, improvement,
-    evaluationMethod: 'local-topic-question-bank',
-    matchedConcepts: matched,
-    note: behavioral ? 'Behavioral answers are assessed for structure, not a single correct personal story.' : 'Local rubric matches answer concepts against this question’s reference keywords; it is a study aid, not semantic or expert grading.',
+    status: 'evaluated', scores, score, missingConcepts, matchedConcepts: coveredTexts,
+    feedback,
+    strength: coveredTexts.length ? 'Reference criteria covered: ' + coveredTexts.join('; ') : '',
+    improvement: missingConcepts.length ? 'Add or clarify: ' + missingConcepts.join('; ') : 'Keep the answer concise and connect each claim to the question.',
+    evaluationMethod: 'reference-clause-rubric',
+    note: behavioral
+      ? 'Equal-weight STAR structure score; it checks reference clauses, not the truth or real-world impact of a personal story.'
+      : 'Equal-weight formula: final question score = mean(correctness, relevance, completeness, problem-solving, communication). Similar wording is evidence only; uncertain answers are marked Needs manual review.',
+    referenceCoverage: Math.round(referenceCoverage * 100), answer: response,
   };
 }
 
-module.exports = { topicNames, buildQuestions, evaluateAnswer };
+module.exports = { topicNames, INTERVIEW_QUESTION_COUNT, buildQuestions, evaluateAnswer };
