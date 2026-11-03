@@ -1,0 +1,9 @@
+packages:
+  - .
+storeDir: ./.pnpm-store
+nodeLinker: hoisted
+packageImportMethod: copy
+overrides:
+  "vite>rollup": "npm:@rollup/wasm-node@4.67.4"
+allowBuilds:
+  esbuild: true

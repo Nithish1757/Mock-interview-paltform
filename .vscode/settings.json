@@ -1,0 +1,7 @@
+{
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "terminal.integrated.env.windows": {
+    "JAVA_HOME": "C:\\Users\\hmnit\\Documents\\Codex\\toolchains\\microsoft-jdk-21\\jdk-21.0.13.0.2+1",
+    "PATH": "C:\\Users\\hmnit\\Documents\\Codex\\toolchains\\pnpm-11.25.0;C:\\Users\\hmnit\\Documents\\Codex\\toolchains\\microsoft-jdk-21\\jdk-21.0.13.0.2+1\\bin;C:\\Users\\hmnit\\Documents\\Codex\\toolchains\\node-v24.22.2-win-x64\\node-v24.22.2-win-x64;${env:PATH}"
+  }
+}
