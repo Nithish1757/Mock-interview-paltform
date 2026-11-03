@@ -2,6 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { Learning, Interview } = require('../models/Record');
 const { publicUser } = require('../auth');
+const { topicNames, buildQuestions, evaluateAnswer } = require('../interviewBank');
 
 const router = express.Router();
 const languages = ['English', 'Spanish', 'Hindi', 'French', 'German', 'Japanese', 'Portuguese', 'Chinese', 'Korean', 'Arabic', 'Russian', 'Italian'];
@@ -323,54 +324,43 @@ router.post('/interviews/start', async (req, res, next) => {
   try {
     const role = String(req.body.role || '').trim().slice(0, 80);
     const difficulty = String(req.body.difficulty || 'Intermediate');
+    const topic = String(req.body.topic || '').trim();
     if (!role) return res.status(400).json({ error: 'Choose a job role to continue.' });
     if (!['Beginner', 'Intermediate', 'Advanced'].includes(difficulty)) return res.status(400).json({ error: 'Choose a valid difficulty.' });
+    if (!topicNames.includes(topic)) return res.status(400).json({ error: 'Choose a valid interview topic.' });
     const voiceMode = Boolean(req.body.voiceMode);
-    const language = voiceMode ? 'English' : (req.user.settings?.outputLanguage || 'English');
-    const generated = { questions: [
-      { type: 'Technical', question: `What core concepts should a ${role} know deeply, and how have you used them?` },
-      { type: 'Technical', question: 'Walk me through a challenging technical problem you solved. What trade-offs did you consider?' },
-      { type: 'Technical', question: 'How do you test your work and make sure it remains maintainable?' },
-      { type: 'Scenario', question: 'A project is behind schedule and a key requirement is unclear. How would you move it forward?' },
-      { type: 'Behavioral', question: 'Tell me about a time you received critical feedback. What changed afterward?' },
-    ] };
-    const record = await Interview.create({ userId: req.userId, role, difficulty, voiceMode, questions: generated.questions.slice(0, 5), answers: [], voiceEvaluations: [], report: null });
-    res.status(201).json(record);
+    const questions = buildQuestions(topic, difficulty);
+    const record = await Interview.create({ userId: req.userId, role, topic, difficulty, voiceMode, questions, answers: [], answerEvaluations: [], voiceEvaluations: [], report: null });
+    const response = record.toObject();
+    response.questions = record.questions.map(({ expectedAnswer, explanation, keywords, ...question }) => question);
+    res.status(201).json(response);
   } catch (error) { next(error); }
 });
 
-router.post('/interviews/:id/voice-answer', async (req, res, next) => {
+async function saveInterviewAnswer(req, res, next, voiceOnly = false) {
   try {
     const index = Number(req.body.index);
     const answer = String(req.body.answer || '').trim().slice(0, 2400);
     if (!Number.isInteger(index) || index < 0 || index > 4) return res.status(400).json({ error: 'Choose a valid question.' });
     if (answer.length < 3) return res.status(400).json({ error: 'Speak or type an answer before continuing.' });
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Interview session not found.' });
-    const interview = await Interview.findOne({ _id: req.params.id, userId: req.userId, voiceMode: true });
-    if (!interview) return res.status(404).json({ error: 'Voice practice session not found.' });
-    const question = interview.questions[index]?.question;
+    const query = { _id: req.params.id, userId: req.userId };
+    if (voiceOnly) query.voiceMode = true;
+    const interview = await Interview.findOne(query);
+    if (!interview) return res.status(404).json({ error: voiceOnly ? 'Voice practice session not found.' : 'Interview session not found.' });
+    const question = interview.questions[index];
     if (!question) return res.status(404).json({ error: 'Interview question not found.' });
-    const words = answer.split(/\s+/).filter(Boolean).length;
-    const sentences = answer.split(/[.!?]+/).filter(Boolean).length;
-    const evaluation = {
-      scores: {
-        correctness: null,
-        relevance: Math.min(82, 50 + Math.min(words, 100) * 0.32),
-        completeness: Math.min(88, 42 + Math.min(words, 120) * 0.38),
-        grammar: Math.min(86, 58 + Math.min(18, sentences * 4) + (/[.!?]$/.test(answer) ? 4 : 0)),
-        clarity: Math.min(86, 52 + sentences * 5 + (words > 20 ? 10 : 0)),
-      },
-      feedback: 'This offline rubric estimates structure and length only; it cannot verify technical correctness. Add a concrete example, explain your decision, and state the result.',
-      strength: words >= 15 ? 'You provided enough detail to review your response structure.' : 'You gave a direct starting point.',
-      improvement: 'Use a clear point, a specific example, and the outcome. Check technical claims against trusted course material.',
-      evaluationMethod: 'local-structure-rubric',
-    };
+    const evaluation = evaluateAnswer(question, answer);
     interview.answers[index] = answer;
-    interview.voiceEvaluations[index] = evaluation;
+    interview.answerEvaluations[index] = evaluation;
+    if (voiceOnly) interview.voiceEvaluations[index] = evaluation;
     await interview.save();
-    res.json({ evaluation, nextQuestion: interview.questions[index + 1] || null, completed: index === 4 });
+    res.json({ evaluation, correctAnswer: question.expectedAnswer, explanation: question.explanation, nextQuestion: interview.questions[index + 1] || null, completed: index === 4 });
   } catch (error) { next(error); }
-});
+}
+
+router.post('/interviews/:id/answer', (req, res, next) => saveInterviewAnswer(req, res, next, false));
+router.post('/interviews/:id/voice-answer', (req, res, next) => saveInterviewAnswer(req, res, next, true));
 
 router.post('/interviews/:id/submit', async (req, res, next) => {
   try {
@@ -379,19 +369,23 @@ router.post('/interviews/:id/submit', async (req, res, next) => {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Interview session not found.' });
     const interview = await Interview.findOne({ _id: req.params.id, userId: req.userId });
     if (!interview) return res.status(404).json({ error: 'Interview session not found.' });
-    const words = answers.map(answer => String(answer).trim().split(/\s+/).filter(Boolean).length);
-    const avgWords = words.reduce((sum, count) => sum + count, 0) / words.length;
-    const overallScore = Math.min(88, Math.round(40 + Math.min(avgWords, 160) * 0.3));
+    const evaluations = answers.map((answer, index) => evaluateAnswer(interview.questions[index], String(answer).trim()));
+    const average = key => Math.round(evaluations.reduce((sum, item) => sum + item.scores[key], 0) / evaluations.length);
+    const overallScore = Math.round(evaluations.reduce((sum, item) => sum + item.score, 0) / evaluations.length);
+    const weak = evaluations.some(item => item.scores.correctness < 60 || item.scores.completeness < 60);
     const report = {
       overallScore,
-      scores: { technicalCorrectness: null, relevance: overallScore, completeness: Math.min(88, overallScore + 3), problemSolving: null, communication: Math.min(90, overallScore + 4), grammar: null, clarity: Math.min(90, overallScore + 2) },
-      strengths: ['You completed all five answers.', 'Your response length gives you room to add examples and reasoning.'],
-      weaknesses: ['This offline report cannot validate technical correctness.', 'Use a specific example and explain the result for each answer.'],
-      improvedAnswers: answers.map(answer => 'Structure suggestion: begin with the direct answer, add a specific example, explain the decision or trade-off, then state the result. Your draft: ' + String(answer).trim()),
-      topicsToRevise: ['Review role-specific fundamentals using trusted references.', 'Practice structured examples with the STAR method.'],
-      evaluationMethod: 'local-structure-rubric',
+      scores: { technicalCorrectness: average('correctness'), relevance: average('relevance'), completeness: average('completeness'), problemSolving: average('completeness'), communication: average('clarity'), grammar: average('grammar'), clarity: average('clarity') },
+      strengths: [overallScore >= 70 ? 'Your answers covered many of the reference concepts.' : 'You completed all five answers and have clear feedback to guide another attempt.', ...evaluations.filter(item => item.score >= 70).slice(0, 2).map(item => item.strength)],
+      weaknesses: [weak ? `Review ${interview.topic} concepts that were absent from your answers.` : 'Add examples and explain the reasoning behind each answer.', ...evaluations.filter(item => item.score < 60).slice(0, 2).map(item => item.improvement)],
+      improvedAnswers: interview.questions.map((question, index) => `Reference answer: ${question.expectedAnswer} Explanation: ${question.explanation}`),
+      topicsToRevise: weak ? [interview.topic, 'Review answers with low concept coverage.'] : [interview.topic, 'Practice explaining examples and trade-offs.'],
+      questionEvaluations: evaluations,
+      evaluationMethod: 'local-topic-question-bank',
+      evaluationNote: 'Scores use local reference keywords and response structure; they are a study aid, not expert semantic grading. Behavioral answers are scored for structure, not personal facts.',
     };
     interview.answers = answers;
+    interview.answerEvaluations = evaluations;
     interview.report = report;
     await interview.save();
     res.json({ ...interview.toObject(), report });
