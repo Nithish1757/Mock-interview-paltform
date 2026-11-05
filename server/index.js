@@ -24,7 +24,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/api/health', (_req, res) => res.json({ service: 'prepai', ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
+app.get('/api/health', (_req, res) => res.json({ service: 'prepai', apiVersion: 3, ok: true, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.use('/api/auth', authRoutes);
 app.use('/api', requireUser, api);
 app.use((error, _req, res, _next) => {
@@ -51,7 +51,9 @@ server.on('error', async error => {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/api/health`);
       const health = await response.json();
-      if (health.service === 'prepai' || (health.ok === true && 'database' in health)) {
+      // Reuse only this API's explicit health signature. A different or older
+      // service may return generic { ok, database } fields on the same port.
+      if (health.service === 'prepai' && health.apiVersion === 3 && health.ok === true && typeof health.database === 'string') {
         console.log(`PrepAI API already running on port ${port}; reusing the existing service.`);
         process.exit(0);
       }
