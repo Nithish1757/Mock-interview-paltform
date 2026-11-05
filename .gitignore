@@ -12,3 +12,5 @@ e2e/
 tools/ollama-home/
 tools/ollama-models/
 tools/local-test*/
+
+yt-dlp.exe
