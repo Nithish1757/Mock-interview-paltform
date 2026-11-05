@@ -336,15 +336,55 @@ async function processVideoLearning({ title, sourceType, sourceUrl, videoLanguag
 
 async function answerVideoQuestion(record, question) {
   const transcript = String(record.transcript || '');
-  const terms = [...new Set((question.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || []))];
   const lines = transcript.split(/\n+/).filter(Boolean);
-  const ranked = lines.map((line, index) => ({ line, index, score: terms.reduce((sum, term) => sum + Number(line.toLowerCase().includes(term)), 0) })).filter(row => row.score).sort((a, b) => b.score - a.score || a.index - b.index).slice(0, 12).sort((a, b) => a.index - b.index);
-  const context = (ranked.length ? ranked.map(row => row.line) : lines.slice(0, 60)).join('\n').slice(0, 22000);
-  const system = `Answer in ${record.outputLanguage || 'English'} using only the timestamped transcript. Never use model knowledge to add video facts. If the transcript does not clearly support an answer, explicitly say it is not covered. Return JSON {answer, sourceReferences:[exact transcript excerpts]}. Keep quotes short and include their timestamps where available.`;
-  const result = await ollamaJson(system, `Question: ${question}\nTranscript evidence:\n${context}`, 120000);
-  const references = Array.isArray(result.sourceReferences) ? result.sourceReferences.filter(ref => context.includes(ref)) : [];
-  if (!references.length) return { answer: 'The transcript does not contain enough evidence to answer that reliably. No video-specific answer was inferred.', mode: 'transcript-grounded', sourceReferences: [] };
-  return { answer: `${String(result.answer || 'The transcript does not contain enough evidence to answer that reliably.')}\n\nTranscript reference: ${references.join(' · ')}`, mode: 'transcript-grounded-ollama', sourceReferences: references };
+  const outputLanguage = record.outputLanguage || 'English';
+  const sourceLanguage = record.sourceLanguage || 'English';
+  const rankLines = searchText => {
+    const rawTerms = searchText.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || [];
+    const terms = [...new Set(rawTerms.flatMap(term => term.length > 4 && term.endsWith('s') ? [term, term.slice(0, -1)] : [term]))];
+    return lines.map((line, index) => ({ line, index, score: terms.reduce((sum, term) => sum + Number(line.toLowerCase().includes(term)), 0) }))
+      .filter(row => row.score).sort((a, b) => b.score - a.score || a.index - b.index).slice(0, 12).sort((a, b) => a.index - b.index);
+  };
+  let ranked = rankLines(question);
+  let retrievalQuestion = question;
+  if (!ranked.length && sourceLanguage !== 'Unknown') {
+    const translation = await ollamaJson(
+      `Translate the question into ${sourceLanguage} to help locate relevant transcript lines. Return JSON {translatedQuestion}. Preserve technical terms and do not answer the question.`,
+      question,
+      60000,
+    ).catch(() => ({}));
+    retrievalQuestion = String(translation.translatedQuestion || question);
+    ranked = rankLines(retrievalQuestion);
+  }
+  let references = ranked.map(row => row.line);
+  if (!references.length) {
+    const candidates = lines.slice(0, 60).map((line, index) => ({ line, index }));
+    const context = candidates.map(row => `SOURCE LINE ${row.index}: ${row.line}`).join('\n').slice(0, 22000);
+    const selection = await ollamaJson(
+      `Check whether the numbered transcript lines explicitly answer the question. Return JSON {supported:boolean,sourceLineNumbers:[integers]}. Select only the minimum lines that contain the answer. The integers must be copied from SOURCE LINE labels. Return supported=false and an empty list when the transcript does not answer it.`,
+      `Question in the transcript language: ${retrievalQuestion}\nTranscript lines:\n${context}`,
+      120000,
+    );
+    const candidateIndexes = new Set(candidates.map(row => row.index));
+    const selectedIndexes = Array.isArray(selection.sourceLineNumbers)
+      ? [...new Set(selection.sourceLineNumbers.map(Number).filter(index => Number.isInteger(index) && candidateIndexes.has(index)))].slice(0, 5)
+      : [];
+    if (selection.supported === true) references = selectedIndexes.map(index => lines[index]);
+  }
+  if (!references.length) {
+    const localized = await ollamaJson(
+      `Translate the fixed no-evidence notice into ${outputLanguage}. Return JSON {notice}. Do not add advice or facts.`,
+      'Notice: The saved transcript does not contain enough evidence to answer this question reliably.',
+      30000,
+    ).catch(() => ({ notice: 'The saved transcript does not contain enough evidence to answer this question reliably.' }));
+    return { answer: String(localized.notice || 'The saved transcript does not contain enough evidence to answer this question reliably.'), mode: 'transcript-grounded', sourceReferences: [] };
+  }
+  const translated = await ollamaJson(
+    `Answer the question entirely in ${outputLanguage} by translating and explaining only the selected transcript evidence. Do not add facts, examples, or details that the evidence does not state. Preserve technical terms when useful. Return JSON {answer}.`,
+    `Question: ${question}\nSelected verbatim transcript evidence:\n${references.join('\n')}`,
+    120000,
+  );
+  return { answer: `${String(translated.answer || '')}\n\nTranscript reference: ${references.join(' · ')}`, mode: 'transcript-grounded-ollama', sourceReferences: references };
 }
 
 module.exports = { checkServices, processVideoLearning, answerVideoQuestion, ollamaJson, parseVtt, parseWhisperResult, splitTranscript, renderTranscript, timeLabel, supportedLanguages };
